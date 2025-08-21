@@ -1,0 +1,371 @@
+sudo -u www-data bash -lc 'mkdir -p /var/www/iatr/resources/views/layouts'
+sudo -u www-data bash -lc 'cat > /var/www/iatr/resources/views/layouts/app.blade.php << "BLADE"
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token() }}">
+  <title>@yield("title","Voiceclean")</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>body{background:#f8f9fa}.navbar{background:#fff}</style>
+</head>
+<body>
+<nav class="navbar navbar-expand-lg border-bottom">
+  <div class="container">
+    <a class="navbar-brand fw-semibold" href="{{ route("voiceclean.dashboard") }}">Voiceclean</a>
+    <div class="ms-auto small text-muted">Laravel</div>
+  </div>
+</nav>
+<div class="container py-4">@yield("content")</div>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+@yield("scripts")
+</body>
+</html>
+BLADE'
+
+
+Paginator (Bootstrap 5) – app/Providers/AppServiceProvider.php:
+
+sudo tee /var/www/iatr/app/Providers/AppServiceProvider.php >/dev/null <<'PHP'
+<?php
+
+namespace App\Providers;
+
+use Illuminate\Support\ServiceProvider;
+use Illuminate\Pagination\Paginator;
+
+class AppServiceProvider extends ServiceProvider
+{
+    public function register(): void {}
+    public function boot(): void
+    {
+        Paginator::useBootstrapFive();
+    }
+}
+PHP
+
+7) Voiceclean Dashboard (klasör sayımı + gözat)
+7.1) Dizinler ve ACL
+sudo mkdir -p /opt/voiceclean/{failed,log,inbox}/{de,fr,tr}
+sudo mkdir -p /opt/voiceclean/data/{inbox,outbox}/{de,fr,tr}
+
+# www-data okuma izni
+sudo setfacl -R -m u:www-data:rx /opt/voiceclean
+sudo setfacl -R -d -m u:www-data:rx /opt/voiceclean
+
+7.2) Config
+sudo tee /var/www/iatr/config/voiceclean.php >/dev/null <<'PHP'
+<?php
+return [
+    'languages' => ['de','fr','tr'],
+    'buckets' => [
+        'data_inbox' => '/opt/voiceclean/data/inbox',
+        'data_outbox'=> '/opt/voiceclean/data/outbox',
+        'failed'     => '/opt/voiceclean/failed',
+        'log'        => '/opt/voiceclean/log',
+        'inbox'      => '/opt/voiceclean/inbox',
+    ],
+    'cache_ttl' => 10, // saniye
+];
+PHP
+
+7.3) Controller
+php /var/www/iatr/artisan make:controller VoicecleanController
+
+
+İçerik (/var/www/iatr/app/Http/Controllers/VoicecleanController.php):
+
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Pagination\LengthAwarePaginator;
+
+class VoicecleanController extends Controller
+{
+    private function roots() { return config('voiceclean.buckets'); }
+    private function langs() { return config('voiceclean.languages'); }
+
+    private function safePath(string $bucket, string $lang): string
+    {
+        $roots = $this->roots();
+        $langs = $this->langs();
+        abort_unless(isset($roots[$bucket]), 404, 'Bucket not found');
+        abort_unless(in_array($lang, $langs, true), 404, 'Lang not found');
+        return rtrim($roots[$bucket], '/').'/'.$lang;
+    }
+
+    private function countFiles(string $dir): int
+    {
+        if (!is_dir($dir)) return 0;
+        $it = new \FilesystemIterator($dir, \FilesystemIterator::SKIP_DOTS);
+        $cnt = 0; foreach ($it as $f) if ($f->isFile()) $cnt++;
+        return $cnt;
+    }
+
+    public function dashboard()
+    {
+        $ttl = (int) config('voiceclean.cache_ttl', 10);
+
+        // Laravel 12 ortamlarında default store "database" kalmasın diye dosya store'u zorla:
+        $counts = Cache::store('file')->remember('voiceclean_counts', $ttl, function () {
+            $data = [];
+            foreach ($this->roots() as $bucket => $root) {
+                foreach ($this->langs() as $lang) {
+                    $dir = rtrim($root, '/').'/'.$lang;
+                    $data[$bucket][$lang] = $this->countFiles($dir);
+                }
+            }
+            return $data;
+        });
+
+        return view('voiceclean.dashboard', [
+            'counts' => $counts,
+            'buckets' => array_keys($this->roots()),
+            'langs' => $this->langs(),
+        ]);
+    }
+
+    public function apiCounts()
+    {
+        $ttl = (int) config('voiceclean.cache_ttl', 10);
+        $payload = Cache::store('file')->remember('voiceclean_counts', $ttl, function () {
+            $data = [];
+            foreach ($this->roots() as $bucket => $root) {
+                foreach ($this->langs() as $lang) {
+                    $dir = rtrim($root, '/').'/'.$lang;
+                    $data[$bucket][$lang] = $this->countFiles($dir);
+                }
+            }
+            return $data;
+        });
+        return response()->json($payload);
+    }
+
+    public function browse(string $bucket, string $lang, Request $req)
+    {
+        $dir = $this->safePath($bucket, $lang);
+        abort_unless(is_dir($dir), 404, 'Directory not found');
+
+        $items = [];
+        $h = opendir($dir);
+        if ($h) {
+            while (($name = readdir($h)) !== false) {
+                if ($name === '.' || $name === '..' || str_starts_with($name, '.')) continue;
+                $path = $dir.'/'.$name;
+                if (!is_file($path)) continue;
+                $items[] = ['name'=>$name,'size'=>filesize($path),'mtime'=>filemtime($path)];
+            }
+            closedir($h);
+        }
+
+        $sort = $req->get('sort','mtime'); $dirn = $req->get('dir','desc');
+        usort($items, fn($a,$b) => ($dirn==='asc'?1:-1) * ($a[$sort] <=> $b[$sort]));
+
+        $page=(int)$req->get('page',1); $per=(int)$req->get('per_page',50);
+        $total=count($items); $slice=array_slice($items, ($page-1)*$per, $per);
+        $paginator=new LengthAwarePaginator($slice,$total,$per,$page,['path'=>$req->url(),'query'=>$req->query()]);
+
+        return view('voiceclean.browse', ['bucket'=>$bucket,'lang'=>$lang,'dir'=>$dir,'files'=>$paginator]);
+    }
+}
+
+7.4) Rotalar
+
+routes/web.php:
+
+use App\Http\Controllers\VoicecleanController;
+
+Route::get('/voiceclean', [VoicecleanController::class, 'dashboard'])->name('voiceclean.dashboard');
+Route::get('/voiceclean/api/counts', [VoicecleanController::class, 'apiCounts'])->name('voiceclean.api.counts');
+Route::get('/voiceclean/browse/{bucket}/{lang}', [VoicecleanController::class, 'browse'])->name('voiceclean.browse');
+
+7.5) Blade’ler
+sudo -u www-data mkdir -p /var/www/iatr/resources/views/voiceclean
+
+
+resources/views/voiceclean/dashboard.blade.php:
+
+@extends('layouts.app')
+@section('content')
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h3 class="mb-0">Voiceclean Dashboard</h3>
+  <button class="btn btn-sm btn-outline-primary" id="refresh">Yenile</button>
+</div>
+<div class="row g-3">
+@foreach($buckets as $bucket)
+  @foreach($langs as $lang)
+    <div class="col-12 col-sm-6 col-md-4 col-lg-3">
+      <div class="card shadow-sm h-100">
+        <div class="card-body">
+          <div class="d-flex justify-content-between">
+            <h6 class="card-title mb-1">{{ $bucket }} / {{ strtoupper($lang) }}</h6>
+            <a href="{{ route('voiceclean.browse', [$bucket,$lang]) }}" class="small">Gözat</a>
+          </div>
+          <div class="display-6 fw-bold" data-cell="{{$bucket}}-{{$lang}}">{{ $counts[$bucket][$lang] ?? 0 }}</div>
+          <div class="text-muted small">dosya</div>
+        </div>
+      </div>
+    </div>
+  @endforeach
+@endforeach
+</div>
+<script>
+document.getElementById('refresh').addEventListener('click', async () => {
+  const r = await fetch('{{ route('voiceclean.api.counts') }}');
+  if(!r.ok) return;
+  const data = await r.json();
+  for (const b in data) for (const l in data[b]) {
+    const el = document.querySelector(`[data-cell="${b}-${l}"]`);
+    if (el) el.textContent = data[b][l];
+  }
+});
+</script>
+@endsection
+
+
+resources/views/voiceclean/browse.blade.php:
+
+@extends('layouts.app')
+@section('content')
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h5 class="mb-0">Gözat: {{ $bucket }} / {{ strtoupper($lang) }}</h5>
+  <a href="{{ route('voiceclean.dashboard') }}" class="btn btn-sm btn-outline-secondary">← Dashboard</a>
+</div>
+<div class="mb-2 text-muted small">Dizin: <code>{{ $dir }}</code></div>
+<div class="table-responsive">
+  <table class="table table-sm table-striped align-middle">
+    <thead>
+      <tr>
+        <th><a href="?sort=name&dir={{ request('dir','desc')==='asc'?'desc':'asc' }}">Dosya</a></th>
+        <th class="text-end"><a href="?sort=size&dir={{ request('dir','desc')==='asc'?'desc':'asc' }}">Boyut</a></th>
+        <th class="text-end"><a href="?sort=mtime&dir={{ request('dir','desc')==='asc'?'desc':'asc' }}">Değiştirilme</a></th>
+      </tr>
+    </thead>
+    <tbody>
+    @forelse($files as $f)
+      <tr>
+        <td class="text-break">{{ $f['name'] }}</td>
+        <td class="text-end">{{ number_format($f['size']/1024,2) }} KB</td>
+        <td class="text-end">{{ \Carbon\Carbon::createFromTimestamp($f['mtime'])->toDateTimeString() }}</td>
+      </tr>
+    @empty
+      <tr><td colspan="3" class="text-center text-muted">Dosya yok</td></tr>
+    @endforelse
+    </tbody>
+  </table>
+</div>
+{{ $files->withQueryString()->links() }}
+@endsection
+
+8) Cache/View temizliği ve servisler
+
+Önemli: optimize:clear arka planda cache:clear çağırır; default store “database” kalırsa DB’ye gider. Biz zaten .env ile CACHE_STORE=file yaptık; yine de fiziki dosyaları da temizleyelim.
+
+sudo rm -f /var/www/iatr/bootstrap/cache/*.php
+sudo rm -rf /var/www/iatr/storage/framework/cache/data/*
+sudo rm -f  /var/www/iatr/storage/framework/views/*.php
+
+sudo -u www-data bash -lc '
+cd /var/www/iatr
+php artisan config:clear
+php artisan cache:clear
+php artisan route:clear
+php artisan view:clear
+'
+sudo systemctl restart php8.3-fpm
+sudo systemctl reload nginx
+
+9) Sağlık ve teşhis
+
+Health route (opsiyonel ama faydalı):
+
+sudo -u www-data bash -lc 'php -r "
+file_put_contents(\"/var/www/iatr/routes/web.php\",
+\"<?php
+use Illuminate\\\\Support\\\\Facades\\\\Route;
+Route::get('/health', fn()=>response()->json([
+  'ok'=>true,'php'=>phpversion(),'laravel'=>app()->version()
+]));
+require __DIR__.'/auth.php';\");
+"'
+
+
+Psysh (tinker) izin fix’i:
+
+sudo -u www-data mkdir -p /var/www/iatr/.config/psysh
+# Kullanırken:
+sudo -u www-data HOME=/var/www/iatr bash -lc "cd /var/www/iatr && php artisan tinker --execute=\"dump(config('cache.default')); dump(config('database.connections.mysql.username'));\""
+# Beklenen: 'file' ve 'scriptuser'
+
+
+HTTP test:
+
+curl -sI -H "Host: iatr.telpass-ltd.live" http://127.0.0.1/voiceclean | head -n 5
+
+10) Sık karşılaşılan hatalar ve kalıcı çözümler
+
+SQLSTATE[HY000] [1698] Access denied for user 'root'@'localhost'
+Sebep: Laravel DB’yi root ile deniyor.
+Çözüm: .env’de scriptuser bilgisi; CACHE_STORE=file; bootstrap/cache/config.php iatr → php-fpm restart.
+
+cache tablosuna erişim/clear sırasında DB hatası
+Sebep: Default cache store ‘database’.
+Çözüm: .env → CACHE_STORE=file (+ CACHE_DRIVER=file), kontrol: config('cache.default') === 'file'.
+
+storage/logs/laravel.log Permission denied
+Çözüm:
+
+sudo chown -R www-data:www-data /var/www/iatr/storage /var/www/iatr/bootstrap/cache
+sudo find ... -type d -exec chmod 775 {} \;
+sudo find ... -type f -exec chmod 664 {} \;
+
+
+View [layouts.app] not found.
+Çözüm: resources/views/layouts/app.blade.php dosyasını oluştur (yukarıdaki layout).
+
+psysh yazma hatası
+Çözüm: sudo -u www-data mkdir -p /var/www/iatr/.config/psysh veya HOME=/var/www/iatr ile çalıştır.
+
+11) (Opsiyonel) Cron & Queue
+# Scheduler
+( crontab -l 2>/dev/null; echo "* * * * * cd /var/www/iatr && /usr/bin/php artisan schedule:run >> /var/log/laravel_schedule.log 2>&1" ) | crontab -
+
+# Queue worker (systemd)
+sudo tee /etc/systemd/system/laravel-queue.service >/dev/null <<'UNIT'
+[Unit]
+Description=Laravel Queue Worker
+After=network.target
+[Service]
+User=www-data
+Restart=always
+RestartSec=3
+ExecStart=/usr/bin/php /var/www/iatr/artisan queue:work --sleep=3 --tries=3 --max-time=3600
+WorkingDirectory=/var/www/iatr
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo systemctl daemon-reload
+sudo systemctl enable --now laravel-queue
+
+12) (İsteğe bağlı) CLI ile tek komutta Voiceclean sayıları
+sudo tee /usr/local/bin/voiceclean_counts.sh >/dev/null <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+buckets=( "data/inbox" "data/outbox" "failed" "log" "inbox" )
+langs=( de fr tr )
+printf "%-15s | %-3s | %8s\n" "Bucket" "Lang" "Files"
+printf -- "-------------------------------\n"
+for b in "${buckets[@]}"; do
+  for l in "${langs[@]}"; do
+    dir="/opt/voiceclean/${b}/${l}"
+    cnt=$(find "$dir" -maxdepth 1 -type f 2>/dev/null | wc -l || echo 0)
+    printf "%-15s | %-3s | %8d\n" "$b" "$l" "$cnt"
+  done
+done
+BASH
+sudo chmod +x /usr/local/bin/voiceclean_counts.sh
+voiceclean_counts.sh
